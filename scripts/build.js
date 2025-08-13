@@ -72,19 +72,73 @@ function writeRss(filePath, title, link, items) {
 
 async function fetchKeyword(searchText, page = 0, size = 100) {
   const endpoint = 'https://eplanning.blm.gov/eplanning-ui/search';
-  const body = JSON.stringify({ searchText, page, size });
+
+  // Try the JSON API first (some environments honor this)
   const res = await fetch(endpoint, {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
-      'accept': 'application/json, text/plain, */*'
+      'accept': 'application/json, text/plain, */*',
+      'user-agent': 'overlook-blm-rss (+https://github.com/treillycodes/overlook-blm-rss)',
+      'x-requested-with': 'XMLHttpRequest',
+      'origin': 'https://eplanning.blm.gov',
+      'referer': 'https://eplanning.blm.gov/eplanning-ui/home'
     },
-    body
+    body: JSON.stringify({ searchText, page, size }),
   });
-  if (!res.ok) throw new Error(`HTTP ${res.status} for "${searchText}"`);
-  const data = await res.json();
-  return normalizeRows(data);
+
+  const ct = (res.headers.get('content-type') || '').toLowerCase();
+
+  // If we actually got JSON, use it
+  if (ct.includes('application/json')) {
+    const data = await res.json();
+    return normalizeRows(data);
+  }
+
+  // Fallback: fetch the HTML search page and parse links
+  return await fetchKeywordViaHtml(searchText);
 }
+
+async function fetchKeywordViaHtml(searchText) {
+  // Build the same page the UI shows when you type in the box
+  const url = 'https://eplanning.blm.gov/eplanning-ui/search?searchText=' + encodeURIComponent(searchText);
+
+  const htmlRes = await fetch(url, {
+    headers: {
+      'user-agent': 'overlook-blm-rss (+https://github.com/treillycodes/overlook-blm-rss)',
+      'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+    }
+  });
+
+  const html = await htmlRes.text();
+
+  // Parse project links like: href="/eplanning-ui/project/1234567/510">Project Title</a>
+  const items = [];
+  const linkRe = /href="(\/eplanning-ui\/project\/(\d+)\/510)"[^>]*>([^<]+)<\/a>/gi;
+
+  let m;
+  while ((m = linkRe.exec(html)) !== null) {
+    const rel = m[1];
+    const id  = m[2];
+    const title = m[3].trim();
+    const abs = 'https://eplanning.blm.gov' + rel;
+
+    items.push({
+      id,
+      title: title || `BLM Project ${id}`,
+      url: abs,
+      // State/office/status aren’t reliably present without extra requests;
+      // we keep them empty in fallback. RSS still works for posting to Discord.
+      state: undefined,
+      office: undefined,
+      nepaStatus: undefined,
+      nepaType: undefined,
+    });
+  }
+
+  return items;
+}
+
 
 async function run() {
   const cfg = JSON.parse(fs.readFileSync(CFG_PATH, 'utf8'));
