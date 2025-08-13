@@ -1,6 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<rss version="2.0"><channel>
-<title>The Overlook — placeholder</title>
-<link>https://eplanning.blm.gov/eplanning-ui/home</link>
-<description>placeholder</description>
-</channel></rss>
+<rss version="2.0">
+<channel>
+  <title>The Overlook — BLM Keyword Watch (National)</title>
+  <link>https://eplanning.blm.gov/eplanning-ui/home</link>
+  <description>The Overlook — BLM Keyword Watch (National)</description>
+  <lastBuildDate>Wed, 13 Aug 2025 05:58:44 GMT</lastBuildDate>
+  
+</channel>
+</rss>
