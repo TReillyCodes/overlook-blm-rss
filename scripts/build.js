@@ -1,6 +1,7 @@
-// Build RSS from BLM keyword search (searchText) endpoint
+// Build RSS from BLM keyword search (renders client-side)
 import fs from 'node:fs';
 import path from 'node:path';
+import puppeteer from 'puppeteer';
 
 const ROOT = process.cwd();
 const CFG_PATH = path.join(ROOT, 'feeds', 'queries.json');
@@ -11,32 +12,7 @@ const OUT_STATE_DIR = path.join(OUT_DIR, 'by-state');
 function ensureDir(p) { fs.mkdirSync(p, { recursive: true }); }
 function nowRfc822() { return new Date().toUTCString(); }
 function escapeXml(s='') {
-  return s.replace(/[<>&'"]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;',"'":'&apos;','"':'&quot;' }[c]));
-}
-
-function normalizeRows(data) {
-  const rows = Array.isArray(data) ? data
-    : Array.isArray(data.items) ? data.items
-    : Array.isArray(data.content) ? data.content
-    : Array.isArray(data.results) ? data.results
-    : Array.isArray(data.data) ? data.data
-    : [];
-
-  return rows.map(p => {
-    const id = String(p.id ?? p.projectId ?? p.nepaId ?? p.documentId ?? p.projectID ?? p.nepaNumber ?? '').trim();
-    const title = (p.projectName ?? p.title ?? p.name ?? `BLM Project ${id}`).toString().trim();
-    const states = p.state ? [p.state] : (Array.isArray(p.states) ? p.states : []);
-    const state = states.filter(Boolean).join(', ') || undefined;
-    const office = p.leadOfficeName ?? p.office ?? p.fieldOffice ?? undefined;
-    const nepaStatus = p.nepaStatus ?? p.nepaStage ?? p.status ?? undefined;
-    const nepaType = p.nepaDocType ?? p.type ?? undefined;
-    const url =
-      p.url ??
-      (p.projectId ? `https://eplanning.blm.gov/eplanning-ui/project/${p.projectId}/510`
-                   : (id ? `https://eplanning.blm.gov/eplanning-ui/project/${id}/510` : undefined));
-
-    return { id, title, url, state, office, nepaStatus, nepaType, raw: p };
-  }).filter(x => x.id && x.url);
+  return s.replace(/[<>&'"]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;',"'":'&apos;','"':'&quot;'}[c]));
 }
 
 function itemToRss(item) {
@@ -70,109 +46,76 @@ function writeRss(filePath, title, link, items) {
   fs.writeFileSync(filePath, xml.trim() + '\n', 'utf8');
 }
 
-async function fetchKeyword(searchText, page = 0, size = 100) {
-  const endpoint = 'https://eplanning.blm.gov/eplanning-ui/search';
+// Scrape a rendered results page for anchors like /eplanning-ui/project/<id>/510
+async function scrapeSearchTerm(page, term) {
+  const url = 'https://eplanning.blm.gov/eplanning-ui/search?searchText=' + encodeURIComponent(term);
+  await page.goto(url, { waitUntil: 'domcontentloaded' });
 
-  // Try the JSON API first (some environments honor this)
-  const res = await fetch(endpoint, {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      'accept': 'application/json, text/plain, */*',
-      'user-agent': 'overlook-blm-rss (+https://github.com/treillycodes/overlook-blm-rss)',
-      'x-requested-with': 'XMLHttpRequest',
-      'origin': 'https://eplanning.blm.gov',
-      'referer': 'https://eplanning.blm.gov/eplanning-ui/home'
-    },
-    body: JSON.stringify({ searchText, page, size }),
-  });
+  // If there is a Search button, click it; some builds require it to fire XHR
+  try {
+    await page.waitForSelector('button:has-text("Search"), [role="button"][aria-label*="Search"]', { timeout: 3000 });
+    await page.click('button:has-text("Search"), [role="button"][aria-label*="Search"]');
+  } catch (_) {}
 
-  const ct = (res.headers.get('content-type') || '').toLowerCase();
+  // Wait for any project link to appear (up to 15s)
+  await page.waitForFunction(() => {
+    return !!document.querySelector('a[href^="/eplanning-ui/project/"][href$="/510"]');
+  }, { timeout: 15000 }).catch(() => {});
 
-  // If we actually got JSON, use it
-  if (ct.includes('application/json')) {
-    const data = await res.json();
-    return normalizeRows(data);
-  }
+  // Grab links and titles
+  const items = await page.$$eval('a[href^="/eplanning-ui/project/"][href$="/510"]', as =>
+    as.map(a => ({
+      url: new URL(a.getAttribute('href'), 'https://eplanning.blm.gov').toString(),
+      title: (a.textContent || '').trim()
+    }))
+  );
 
-  // Fallback: fetch the HTML search page and parse links
-  return await fetchKeywordViaHtml(searchText);
+  // Map to our shape with ID extracted
+  const mapped = items.map(({ url, title }) => {
+    const m = url.match(/\/project\/(\d+)\/510/);
+    const id = m ? m[1] : undefined;
+    return id ? { id, title: title || `BLM Project ${id}`, url } : null;
+  }).filter(Boolean);
+
+  return mapped;
 }
-
-async function fetchKeywordViaHtml(searchText) {
-  // Build the same page the UI shows when you type in the box
-  const url = 'https://eplanning.blm.gov/eplanning-ui/search?searchText=' + encodeURIComponent(searchText);
-
-  const htmlRes = await fetch(url, {
-    headers: {
-      'user-agent': 'overlook-blm-rss (+https://github.com/treillycodes/overlook-blm-rss)',
-      'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
-    }
-  });
-
-  const html = await htmlRes.text();
-
-  // Parse project links like: href="/eplanning-ui/project/1234567/510">Project Title</a>
-  const items = [];
-  const linkRe = /href="(\/eplanning-ui\/project\/(\d+)\/510)"[^>]*>([^<]+)<\/a>/gi;
-
-  let m;
-  while ((m = linkRe.exec(html)) !== null) {
-    const rel = m[1];
-    const id  = m[2];
-    const title = m[3].trim();
-    const abs = 'https://eplanning.blm.gov' + rel;
-
-    items.push({
-      id,
-      title: title || `BLM Project ${id}`,
-      url: abs,
-      // State/office/status aren’t reliably present without extra requests;
-      // we keep them empty in fallback. RSS still works for posting to Discord.
-      state: undefined,
-      office: undefined,
-      nepaStatus: undefined,
-      nepaType: undefined,
-    });
-  }
-
-  return items;
-}
-
 
 async function run() {
   const cfg = JSON.parse(fs.readFileSync(CFG_PATH, 'utf8'));
   const states = Array.isArray(cfg.states) ? cfg.states : [];
   const queries = Array.isArray(cfg.queries) ? cfg.queries : [];
 
+  const browser = await puppeteer.launch({ args: ['--no-sandbox','--disable-setuid-sandbox'] });
+  const page = await browser.newPage();
+  await page.setUserAgent('overlook-blm-rss (+https://github.com/treillycodes/overlook-blm-rss)');
+
   const merged = [];
   const seen = new Set();
 
-  // For each query, run once per state (if perState), otherwise national once
   for (const q of queries) {
     if (!q || !q.searchText) continue;
 
+    const terms = [];
     if (q.perState && states.length) {
-      for (const st of states) {
-        const term = `${q.searchText} ${st}`.trim();
-        const rows = await fetchKeyword(term);
-        for (const r of rows) {
-          if (seen.has(r.id)) continue;
-          seen.add(r.id);
-          merged.push(r);
-        }
-      }
+      for (const st of states) terms.push(`${q.searchText} ${st}`.trim());
     } else {
-      const rows = await fetchKeyword(q.searchText);
+      terms.push(q.searchText);
+    }
+
+    for (const term of terms) {
+      const rows = await scrapeSearchTerm(page, term);
       for (const r of rows) {
-        if (seen.has(r.id)) continue;
-        seen.add(r.id);
-        merged.push(r);
+        const key = `${r.id}|${r.url}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        merged.push({ ...r });
       }
     }
   }
 
-  // Output master feed
+  await browser.close();
+
+  // Write master feed
   ensureDir(OUT_DIR);
   writeRss(
     OUT_MAIN,
@@ -181,31 +124,7 @@ async function run() {
     merged
   );
 
-  // Optional per-state feeds (based on item state metadata, if present)
-  const byState = new Map();
-  for (const r of merged) {
-    const states = (r.state || '').split(',').map(s => s.trim()).filter(Boolean);
-    if (!states.length) continue;
-    for (const st of states) {
-      if (!byState.has(st)) byState.set(st, []);
-      byState.get(st).push(r);
-    }
-  }
-
-  if (byState.size) {
-    ensureDir(OUT_STATE_DIR);
-    for (const [st, items] of byState.entries()) {
-      const fname = st.toUpperCase().replace(/[^A-Z]/g, '');
-      const fpath = path.join(OUT_STATE_DIR, `${fname}.xml`);
-      writeRss(
-        fpath,
-        `The Overlook — BLM Keyword Watch (${st})`,
-        'https://eplanning.blm.gov/eplanning-ui/home',
-        items
-      );
-    }
-  }
-
+  // Optional per-state feeds (we don’t get state reliably via keyword scrape, so skip unless you later enrich)
   fs.writeFileSync(path.join(OUT_DIR, 'last-run.json'),
     JSON.stringify({ generatedAt: new Date().toISOString(), total: merged.length }, null, 2));
 }
