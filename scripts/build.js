@@ -1,28 +1,17 @@
-// Build RSS from BLM NEPA search API
+// Build RSS from BLM keyword search (searchText) endpoint
 import fs from 'node:fs';
 import path from 'node:path';
 
 const ROOT = process.cwd();
-const SEARCHES_PATH = path.join(ROOT, 'feeds', 'searches.json');
+const CFG_PATH = path.join(ROOT, 'feeds', 'queries.json');
 const OUT_DIR = path.join(ROOT, 'docs');
-const OUT_MAIN = path.join(OUT_DIR, 'index.xml');          // master feed
-const OUT_STATE_DIR = path.join(OUT_DIR, 'by-state');       // optional per-state feeds
+const OUT_MAIN = path.join(OUT_DIR, 'index.xml');
+const OUT_STATE_DIR = path.join(OUT_DIR, 'by-state');
 
-// ---- helpers ---------------------------------------------------------------
-
-function ensureDir(p) {
-  fs.mkdirSync(p, { recursive: true });
-}
-
-function parseAdvFromUrl(u) {
-  try {
-    const url = new URL(u);
-    const raw = url.searchParams.get('advSearch');
-    if (!raw) return null;
-    return JSON.parse(decodeURIComponent(raw));
-  } catch {
-    return null;
-  }
+function ensureDir(p) { fs.mkdirSync(p, { recursive: true }); }
+function nowRfc822() { return new Date().toUTCString(); }
+function escapeXml(s='') {
+  return s.replace(/[<>&'"]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;',"'":'&apos;','"':'&quot;' }[c]));
 }
 
 function normalizeRows(data) {
@@ -32,14 +21,11 @@ function normalizeRows(data) {
     : Array.isArray(data.results) ? data.results
     : Array.isArray(data.data) ? data.data
     : [];
+
   return rows.map(p => {
-    const id = String(
-      p.id ?? p.projectId ?? p.nepaId ?? p.documentId ?? p.projectID ?? p.nepaNumber ?? ''
-    ).trim();
+    const id = String(p.id ?? p.projectId ?? p.nepaId ?? p.documentId ?? p.projectID ?? p.nepaNumber ?? '').trim();
     const title = (p.projectName ?? p.title ?? p.name ?? `BLM Project ${id}`).toString().trim();
-    const states = p.state
-      ? [p.state]
-      : Array.isArray(p.states) ? p.states : [];
+    const states = p.state ? [p.state] : (Array.isArray(p.states) ? p.states : []);
     const state = states.filter(Boolean).join(', ') || undefined;
     const office = p.leadOfficeName ?? p.office ?? p.fieldOffice ?? undefined;
     const nepaStatus = p.nepaStatus ?? p.nepaStage ?? p.status ?? undefined;
@@ -47,20 +33,10 @@ function normalizeRows(data) {
     const url =
       p.url ??
       (p.projectId ? `https://eplanning.blm.gov/eplanning-ui/project/${p.projectId}/510`
-                   : id ? `https://eplanning.blm.gov/eplanning-ui/project/${id}/510`
-                        : undefined);
+                   : (id ? `https://eplanning.blm.gov/eplanning-ui/project/${id}/510` : undefined));
+
     return { id, title, url, state, office, nepaStatus, nepaType, raw: p };
   }).filter(x => x.id && x.url);
-}
-
-function escapeXml(s='') {
-  return s.replace(/[<>&'"]/g, c => ({
-    '<':'&lt;','>':'&gt;','&':'&amp;',"'":'&apos;','"':'&quot;'
-  }[c]));
-}
-
-function nowRfc822() {
-  return new Date().toUTCString();
 }
 
 function itemToRss(item) {
@@ -70,7 +46,6 @@ function itemToRss(item) {
   if (item.nepaType) descParts.push(`<b>Doc:</b> ${escapeXml(item.nepaType)}`);
   if (item.nepaStatus) descParts.push(`<b>Status:</b> ${escapeXml(item.nepaStatus)}`);
   const description = descParts.length ? `<p>${descParts.join('<br/>')}</p>` : '';
-
   return `
   <item>
     <guid isPermaLink="false">${escapeXml(item.id)}</guid>
@@ -95,43 +70,51 @@ function writeRss(filePath, title, link, items) {
   fs.writeFileSync(filePath, xml.trim() + '\n', 'utf8');
 }
 
-// ---- main ------------------------------------------------------------------
+async function fetchKeyword(searchText, page = 0, size = 100) {
+  const endpoint = 'https://eplanning.blm.gov/eplanning-ui/search';
+  const body = JSON.stringify({ searchText, page, size });
+  const res = await fetch(endpoint, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'accept': 'application/json, text/plain, */*'
+    },
+    body
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status} for "${searchText}"`);
+  const data = await res.json();
+  return normalizeRows(data);
+}
 
 async function run() {
-  const searches = JSON.parse(fs.readFileSync(SEARCHES_PATH, 'utf8'));
+  const cfg = JSON.parse(fs.readFileSync(CFG_PATH, 'utf8'));
+  const states = Array.isArray(cfg.states) ? cfg.states : [];
+  const queries = Array.isArray(cfg.queries) ? cfg.queries : [];
 
-  const endpoint = 'https://eplanning.blm.gov/eplanning-ui/search';
   const merged = [];
   const seen = new Set();
 
-  for (const s of searches) {
-    const adv = s.advSearch || parseAdvFromUrl(s.url || s.link || s.href);
-    if (!adv) continue;
+  // For each query, run once per state (if perState), otherwise national once
+  for (const q of queries) {
+    if (!q || !q.searchText) continue;
 
-    // One page of up to 100 results per search. Duplicate the call with page:1 if needed later.
-    const body = JSON.stringify({ advSearch: adv, page: 0, size: 100 });
-
-    const res = await fetch(endpoint, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        'accept': 'application/json, text/plain, */*'
-      },
-      body
-    });
-
-    if (!res.ok) {
-      console.error(`HTTP ${res.status} for search "${s.name || 'unnamed'}"`);
-      continue;
-    }
-
-    const data = await res.json();
-    const rows = normalizeRows(data);
-
-    for (const r of rows) {
-      if (seen.has(r.id)) continue;
-      seen.add(r.id);
-      merged.push(r);
+    if (q.perState && states.length) {
+      for (const st of states) {
+        const term = `${q.searchText} ${st}`.trim();
+        const rows = await fetchKeyword(term);
+        for (const r of rows) {
+          if (seen.has(r.id)) continue;
+          seen.add(r.id);
+          merged.push(r);
+        }
+      }
+    } else {
+      const rows = await fetchKeyword(q.searchText);
+      for (const r of rows) {
+        if (seen.has(r.id)) continue;
+        seen.add(r.id);
+        merged.push(r);
+      }
     }
   }
 
@@ -139,12 +122,12 @@ async function run() {
   ensureDir(OUT_DIR);
   writeRss(
     OUT_MAIN,
-    'The Overlook — BLM Lands & Realty Watch (National)',
+    'The Overlook — BLM Keyword Watch (National)',
     'https://eplanning.blm.gov/eplanning-ui/home',
     merged
   );
 
-  // Optional per-state feeds
+  // Optional per-state feeds (based on item state metadata, if present)
   const byState = new Map();
   for (const r of merged) {
     const states = (r.state || '').split(',').map(s => s.trim()).filter(Boolean);
@@ -162,14 +145,13 @@ async function run() {
       const fpath = path.join(OUT_STATE_DIR, `${fname}.xml`);
       writeRss(
         fpath,
-        `The Overlook — BLM Watch (${st})`,
+        `The Overlook — BLM Keyword Watch (${st})`,
         'https://eplanning.blm.gov/eplanning-ui/home',
         items
       );
     }
   }
 
-  // Simple marker for debugging
   fs.writeFileSync(path.join(OUT_DIR, 'last-run.json'),
     JSON.stringify({ generatedAt: new Date().toISOString(), total: merged.length }, null, 2));
 }
