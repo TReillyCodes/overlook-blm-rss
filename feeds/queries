@@ -1,0 +1,30 @@
+{
+  "states": [
+    "Nevada",
+    "Utah",
+    "Arizona",
+    "Colorado",
+    "New Mexico",
+    "Idaho",
+    "Wyoming",
+    "Oregon",
+    "Montana",
+    "California"
+  ],
+
+  "queries": [
+    { "name": "Private transfer",      "searchText": "private transfer",      "perState": true },
+    { "name": "Direct land sale",      "searchText": "direct land sale",      "perState": true },
+    { "name": "Land sale",             "searchText": "land sale",             "perState": true },
+    { "name": "Notice of Realty Action","searchText": "notice of realty action","perState": false },
+    { "name": "Land exchange",         "searchText": "land exchange",         "perState": true },
+    { "name": "Land tenure",           "searchText": "land tenure",           "perState": true },
+    { "name": "R&PP",                  "searchText": "R&PP",                  "perState": true },
+    { "name": "Lease and/or conveyance","searchText": "classification for lease and/or conveyance","perState": false },
+    { "name": "Disposal",              "searchText": "disposal",              "perState": true },
+    { "name": "Withdrawal",            "searchText": "withdrawal",            "perState": true },
+    { "name": "Opening order",         "searchText": "opening order",         "perState": false },
+    { "name": "Segregation order",     "searchText": "segregation order",     "perState": false },
+    { "name": "Affordable housing",    "searchText": "affordable housing",    "perState": true }
+  ]
+}
